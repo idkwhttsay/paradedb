@@ -12,6 +12,7 @@ use rust_icu_sys::UBreakIteratorType;
 use rust_icu_ubrk::UBreakIterator;
 use rust_icu_uloc;
 use rust_icu_ustring::UChar;
+use std::collections::VecDeque;
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -29,6 +30,7 @@ struct ICUBreakingWord<'a> {
     text: &'a str,
     utf16_indices_to_byte_offsets: Vec<usize>,
     default_breaking_iterator: UBreakIterator,
+    pending: VecDeque<(String, usize, usize)>,
 }
 
 impl<'a> std::fmt::Debug for ICUBreakingWord<'a> {
@@ -74,6 +76,7 @@ impl<'a> From<&'a str> for ICUBreakingWord<'a> {
                 ustr,
             )
             .expect("cannot create iterator"),
+            pending: VecDeque::new(),
         }
     }
 }
@@ -82,6 +85,9 @@ impl<'a> Iterator for ICUBreakingWord<'a> {
     type Item = (String, usize, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(tok) = self.pending.pop_front() {
+            return Some(tok);
+        }
         let mut start = self.default_breaking_iterator.current() as usize;
         'find_end: loop {
             let mut end = self.default_breaking_iterator.next()?;
@@ -108,6 +114,46 @@ impl<'a> Iterator for ICUBreakingWord<'a> {
                     // the string doesn't contain any alphanumerics, so keep extending it
                     // until it does
                     continue 'find_end;
+                }
+
+                // Additional domain-like splitting: if we have dot-separated alpha-numeric segments
+                // (e.g., "blue.cis.pitt.edu"), split on '.' and return each segment as its own token
+                if substring.contains('.') {
+                    // Build sub-segments and their byte offsets
+                    let mut seg_start_rel = 0usize;
+                    let bytes = substring.as_bytes();
+                    for (i, &b) in bytes.iter().enumerate() {
+                        if b == b'.' {
+                            if i > seg_start_rel {
+                                let seg = &substring[seg_start_rel..i];
+                                if seg.chars().any(char::is_alphanumeric) {
+                                    let abs_start = start_byte + seg_start_rel;
+                                    let abs_end = start_byte + i;
+                                    self.pending
+                                        .push_back((seg.to_string(), abs_start, abs_end));
+                                }
+                            }
+                            // skip the '.' and continue
+                            seg_start_rel = i + 1;
+                        }
+                    }
+                    // Push the trailing segment if any
+                    if seg_start_rel < bytes.len() {
+                        let seg = &substring[seg_start_rel..];
+                        if seg.chars().any(char::is_alphanumeric) {
+                            let abs_start = start_byte + seg_start_rel;
+                            let abs_end = end_byte;
+                            self.pending
+                                .push_back((seg.to_string(), abs_start, abs_end));
+                        }
+                    }
+
+                    if let Some(tok) = self.pending.pop_front() {
+                        return Some(tok);
+                    } else {
+                        // Fallback: no valid segments (shouldn't happen given earlier alnum check)
+                        continue 'find_end;
+                    }
                 }
 
                 return Some((substring.into(), start_byte, end_byte));
